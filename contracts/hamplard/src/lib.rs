@@ -75,8 +75,11 @@
 //! - **Course quality or accuracy** — admin approval is a policy gate only; the contract
 //!   does not validate course content or instructor qualifications.
 //! - **Instructor insolvency** — if the instructor's earnings balance is insufficient for a
-//!   refund (e.g. concurrent withdrawals), the archive refund will panic. Callers must
-//!   ensure balances are adequate before invoking `archive_course` with refunds.
+//!   refund (e.g. concurrent withdrawals), the refund is still processed: the
+//!   instructor's available balance is debited in full and the platform treasury
+//!   covers the remaining shortfall (partial clawback with platform top-up). This
+//!   guarantees refunds can never be blocked by a co-instructor withdrawing early.
+//!   The shortfall is emitted via the `refund_shortfall_covered` event for audit.
 //! - **Token price risk** — payment amounts are fixed in token stroops at enrollment time;
 //!   the contract makes no exchange-rate or price guarantees.
 //! - **Front-running** — enrollment order is determined by ledger sequence; the contract
