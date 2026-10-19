@@ -608,6 +608,10 @@ pub enum DataKey2 {
     HighValueCourseThreshold,
     /// Stores the first approver's address for a high-value course pending co-signature
     HighValueCourseApproval(String),
+    /// Total outstanding un-withdrawn instructor earnings for a token (in stroops)
+    TotalInstructorEarnings(Address),
+    /// Total outstanding arbitration fees held for a token (in stroops)
+    TotalArbitrationFees(Address),
 }
 
 /// A proposed contract code upgrade awaiting its governance time-lock.
@@ -2535,7 +2539,7 @@ impl HamplardContract {
                 .is_err()
             {
                 Self::emit_enrollment_failed(env, student, course_id, "INSUFFICIENT_BALANCE");
-                return;
+                panic!("insufficient balance");
             }
             let balance_after = token_client.balance(&env.current_contract_address());
 
@@ -2545,7 +2549,7 @@ impl HamplardContract {
 
             if actual_received != course.price {
                 Self::emit_enrollment_failed(env, student, course_id, "TRANSFER_AMOUNT_MISMATCH");
-                return;
+                panic!("token transfer amount mismatch");
             }
 
             if platform_amount > 0 {
@@ -2948,13 +2952,13 @@ impl HamplardContract {
         if course.status != CourseStatus::Active {
             panic!("course is not available for enrollment");
         }
-        
+
         if let Some(start) = course.enrollment_start_ledger {
             if env.ledger().sequence() < start {
                 panic!("enrollment has not started for this course");
             }
         }
-            
+
         if !env
             .storage()
             .instance()
@@ -3028,7 +3032,7 @@ impl HamplardContract {
                 .is_err()
             {
                 Self::emit_enrollment_failed(&env, &student, &course_id, "INSUFFICIENT_BALANCE");
-                return;
+                panic!("insufficient balance");
             }
 
             let balance_after = token_client.balance(&env.current_contract_address());
@@ -3037,8 +3041,13 @@ impl HamplardContract {
                 .unwrap_or_else(|| panic!("balance overflow during transfer verification"));
 
             if actual_received != course.price {
-                Self::emit_enrollment_failed(&env, &student, &course_id, "TRANSFER_AMOUNT_MISMATCH");
-                return;
+                Self::emit_enrollment_failed(
+                    &env,
+                    &student,
+                    &course_id,
+                    "TRANSFER_AMOUNT_MISMATCH",
+                );
+                panic!("token transfer amount mismatch");
             }
 
             if platform_amount > 0 {
@@ -3198,6 +3207,18 @@ impl HamplardContract {
             env.storage().persistent().set(&earnings_key, &new_balance);
         }
 
+        // Decrement total outstanding instructor earnings for this token
+        let outstanding_key = DataKey2::TotalInstructorEarnings(token.clone());
+        let current_outstanding: i128 = env.storage().instance().get(&outstanding_key).unwrap_or(0);
+        let new_outstanding = current_outstanding.saturating_sub(withdraw_amount);
+        if new_outstanding == 0 {
+            env.storage().instance().remove(&outstanding_key);
+        } else {
+            env.storage()
+                .instance()
+                .set(&outstanding_key, &new_outstanding);
+        }
+
         let token_client = token::Client::new(&env, &token);
         token_client.transfer(
             &env.current_contract_address(),
@@ -3225,6 +3246,58 @@ impl HamplardContract {
             .persistent()
             .get(&DataKey::InstructorTotalEarnings(instructor))
             .unwrap_or(0)
+    }
+
+    /// Internal helper: returns the total tracked liabilities for a token
+    /// (outstanding instructor earnings + outstanding open arbitration fees).
+    pub(crate) fn get_total_liabilities_internal(env: &Env, token: &Address) -> i128 {
+        let earnings: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey2::TotalInstructorEarnings(token.clone()))
+            .unwrap_or(0);
+        let arb_fees: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey2::TotalArbitrationFees(token.clone()))
+            .unwrap_or(0);
+        earnings
+            .checked_add(arb_fees)
+            .unwrap_or_else(|| panic!("liabilities overflow"))
+    }
+
+    /// Get total tracked liabilities for a token (outstanding instructor earnings + arbitration fees)
+    pub fn get_total_liabilities(env: Env, token: Address) -> i128 {
+        Self::get_total_liabilities_internal(&env, &token)
+    }
+
+    /// Alias for get_total_liabilities: returns total owed balance for a token
+    pub fn get_owed_balance(env: Env, token: Address) -> i128 {
+        Self::get_total_liabilities_internal(&env, &token)
+    }
+
+    /// Get total outstanding un-withdrawn instructor earnings for a token
+    pub fn get_outstanding_earnings(env: Env, token: Address) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey2::TotalInstructorEarnings(token))
+            .unwrap_or(0)
+    }
+
+    /// Get total arbitration fees held for a token
+    pub fn get_total_arbitration_fees(env: Env, token: Address) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey2::TotalArbitrationFees(token))
+            .unwrap_or(0)
+    }
+
+    /// Get the available surplus balance that can be swept via withdraw_tokens()
+    pub fn get_surplus_balance(env: Env, token: Address) -> i128 {
+        let token_client = token::Client::new(&env, &token);
+        let balance = token_client.balance(&env.current_contract_address());
+        let liabilities = Self::get_total_liabilities_internal(&env, &token);
+        balance.saturating_sub(liabilities)
     }
 
     // ----------------------------------------------------------
@@ -3869,6 +3942,14 @@ impl HamplardContract {
         admin2.require_auth();
         Self::require_multi_admin(&env, &admin1, &admin2);
         let token_client = token::Client::new(&env, &token);
+        let contract_balance = token_client.balance(&env.current_contract_address());
+        let total_liabilities = Self::get_total_liabilities_internal(&env, &token);
+
+        let available_surplus = contract_balance.saturating_sub(total_liabilities);
+        if amount > available_surplus {
+            panic!("withdraw_tokens: cannot withdraw below tracked liabilities");
+        }
+
         token_client.transfer(&env.current_contract_address(), &destination, &amount);
 
         env.events().publish(
@@ -5486,6 +5567,16 @@ impl HamplardContract {
             Self::PERSISTENT_TTL_THRESHOLD,
             Self::PERSISTENT_TTL_EXTEND_TO,
         );
+
+        // Track total outstanding instructor earnings for this token across all instructors
+        let outstanding_key = DataKey2::TotalInstructorEarnings(token.clone());
+        let current_outstanding: i128 = env.storage().instance().get(&outstanding_key).unwrap_or(0);
+        let new_outstanding = current_outstanding
+            .checked_add(amount)
+            .unwrap_or_else(|| panic!("overflow computing total outstanding instructor earnings"));
+        env.storage()
+            .instance()
+            .set(&outstanding_key, &new_outstanding);
     }
 
     fn debit_instructor_earnings(env: &Env, instructor: &Address, token: &Address, amount: i128) {
@@ -5511,6 +5602,18 @@ impl HamplardContract {
             env.storage().persistent().remove(&total_key);
         } else {
             env.storage().persistent().set(&total_key, &new_total);
+        }
+
+        // Decrement total outstanding instructor earnings for this token
+        let outstanding_key = DataKey2::TotalInstructorEarnings(token.clone());
+        let current_outstanding: i128 = env.storage().instance().get(&outstanding_key).unwrap_or(0);
+        let new_outstanding = current_outstanding.saturating_sub(amount);
+        if new_outstanding == 0 {
+            env.storage().instance().remove(&outstanding_key);
+        } else {
+            env.storage()
+                .instance()
+                .set(&outstanding_key, &new_outstanding);
         }
     }
 
@@ -5956,6 +6059,14 @@ impl HamplardContract {
             Self::PERSISTENT_TTL_EXTEND_TO,
         );
 
+        // Track total outstanding arbitration fees for this token
+        let arb_key = DataKey2::TotalArbitrationFees(course.token.clone());
+        let current_arb: i128 = env.storage().instance().get(&arb_key).unwrap_or(0);
+        let new_arb = current_arb
+            .checked_add(config.fee_per_case)
+            .unwrap_or_else(|| panic!("overflow computing total arbitration fees"));
+        env.storage().instance().set(&arb_key, &new_arb);
+
         env.events().publish(
             (Symbol::new(&env, "dispute_escalated"), course_id.clone()),
             (caller, course_id, config.fee_per_case),
@@ -6034,6 +6145,16 @@ impl HamplardContract {
             Self::PERSISTENT_TTL_THRESHOLD,
             Self::PERSISTENT_TTL_EXTEND_TO,
         );
+
+        // Decrement total outstanding arbitration fees for this token
+        let arb_key = DataKey2::TotalArbitrationFees(case.token.clone());
+        let current_arb: i128 = env.storage().instance().get(&arb_key).unwrap_or(0);
+        let new_arb = current_arb.saturating_sub(case.fee_paid);
+        if new_arb == 0 {
+            env.storage().instance().remove(&arb_key);
+        } else {
+            env.storage().instance().set(&arb_key, &new_arb);
+        }
 
         env.events().publish(
             (Symbol::new(&env, "arbitration_resolved"), course_id.clone()),
