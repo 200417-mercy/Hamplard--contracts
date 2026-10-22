@@ -19,7 +19,8 @@
 //! - `process_refund` — approves a pending refund; if the enrollment already has a
 //!   certificate issued, the certificate is revoked with reason `REFUNDED` and a
 //!   `certificate_revoked` event is emitted, so no refunded enrollment can leave
-//!   behind a certificate that verifies as valid
+//!   behind a certificate that verifies as valid. Refund requests are rejected for
+//!   free (price 0) enrollments, since there is no economic value to refund.
 //! - `bulk_revoke_course_certificates` — flags every certificate of a course as revoked in one transaction
 //! - `pause_platform` / `unpause_platform` — halts or restores all enrollments
 //! - `add_approved_token` / `remove_approved_token` — controls which token contracts are accepted
@@ -75,8 +76,11 @@
 //! - **Course quality or accuracy** — admin approval is a policy gate only; the contract
 //!   does not validate course content or instructor qualifications.
 //! - **Instructor insolvency** — if the instructor's earnings balance is insufficient for a
-//!   refund (e.g. concurrent withdrawals), the archive refund will panic. Callers must
-//!   ensure balances are adequate before invoking `archive_course` with refunds.
+//!   refund (e.g. concurrent withdrawals), the refund is still processed: the
+//!   instructor's available balance is debited in full and the platform treasury
+//!   covers the remaining shortfall (partial clawback with platform top-up). This
+//!   guarantees refunds can never be blocked by a co-instructor withdrawing early.
+//!   The shortfall is emitted via the `refund_shortfall_covered` event for audit.
 //! - **Token price risk** — payment amounts are fixed in token stroops at enrollment time;
 //!   the contract makes no exchange-rate or price guarantees.
 //! - **Front-running** — enrollment order is determined by ledger sequence; the contract
@@ -551,7 +555,7 @@ pub enum DataKey {
     RiskFeeConfig,
     /// Flag indicating whether risk-based fee pricing is enabled
     RiskConfigEnabled,
-    /// Total active enrollments across all courses platform-wide
+    /// Persistent total active enrollments; legacy deployments used instance storage.
     TotalActiveEnrollments,
     /// Maximum total active enrollments allowed platform-wide
     PlatformEnrollmentCap,
@@ -1693,15 +1697,9 @@ impl HamplardContract {
                             course.active_enrollments -= 1;
                         }
 
-                        let total_active: u32 = env
-                            .storage()
-                            .instance()
-                            .get(&DataKey::TotalActiveEnrollments)
-                            .unwrap_or(0);
+                        let total_active: u32 = Self::read_total_active_enrollments(&env);
                         if total_active > 0 {
-                            env.storage()
-                                .instance()
-                                .set(&DataKey::TotalActiveEnrollments, &(total_active - 1));
+                            Self::write_total_active_enrollments(&env, total_active - 1);
                         }
 
                         Self::promote_from_waitlist(&env, &course_id);
@@ -2376,11 +2374,7 @@ impl HamplardContract {
             .instance()
             .get::<DataKey, u32>(&DataKey::PlatformEnrollmentCap)
         {
-            let total_active: u32 = env
-                .storage()
-                .instance()
-                .get(&DataKey::TotalActiveEnrollments)
-                .unwrap_or(0);
+            let total_active: u32 = Self::read_total_active_enrollments(env);
             if total_active >= platform_cap {
                 panic!("platform has reached maximum total enrollment capacity");
             }
@@ -2686,16 +2680,12 @@ impl HamplardContract {
             .set(&DataKey::Course(course_id.clone()), &course);
 
         // Increment platform-wide active enrollment counter
-        let total_active: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::TotalActiveEnrollments)
-            .unwrap_or(0);
-        env.storage().instance().set(
-            &DataKey::TotalActiveEnrollments,
-            &(total_active
+        let total_active: u32 = Self::read_total_active_enrollments(env);
+        Self::write_total_active_enrollments(
+            env,
+            total_active
                 .checked_add(1)
-                .unwrap_or_else(|| panic!("platform enrollment counter overflow"))),
+                .expect("platform enrollment counter overflow"),
         );
 
         Self::update_instructor_stats(env, &course.instructor, |s| {
@@ -2876,16 +2866,12 @@ impl HamplardContract {
             .persistent()
             .set(&DataKey::Course(course_id.clone()), &course);
 
-        let total_active: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::TotalActiveEnrollments)
-            .unwrap_or(0);
-        env.storage().instance().set(
-            &DataKey::TotalActiveEnrollments,
-            &(total_active
+        let total_active: u32 = Self::read_total_active_enrollments(env);
+        Self::write_total_active_enrollments(
+            env,
+            total_active
                 .checked_add(1)
-                .unwrap_or_else(|| panic!("platform enrollment counter overflow"))),
+                .expect("platform enrollment counter overflow"),
         );
 
         Self::update_instructor_stats(env, &course.instructor, |s| {
@@ -3048,6 +3034,7 @@ impl HamplardContract {
                     "TRANSFER_AMOUNT_MISMATCH",
                 );
                 panic!("token transfer amount mismatch");
+                return;
             }
 
             if platform_amount > 0 {
@@ -3125,16 +3112,12 @@ impl HamplardContract {
             .set(&DataKey::Course(course_id.clone()), &course);
 
         // Increment platform-wide active enrollment counter
-        let total_active: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::TotalActiveEnrollments)
-            .unwrap_or(0);
-        env.storage().instance().set(
-            &DataKey::TotalActiveEnrollments,
-            &(total_active
+        let total_active: u32 = Self::read_total_active_enrollments(&env);
+        Self::write_total_active_enrollments(
+            &env,
+            total_active
                 .checked_add(1)
-                .unwrap_or_else(|| panic!("platform enrollment counter overflow"))),
+                .expect("platform enrollment counter overflow"),
         );
 
         Self::update_instructor_stats(&env, &course.instructor, |s| {
@@ -3412,15 +3395,9 @@ impl HamplardContract {
         }
 
         // Decrement platform-wide active enrollment counter
-        let total_active: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::TotalActiveEnrollments)
-            .unwrap_or(0);
+        let total_active: u32 = Self::read_total_active_enrollments(&env);
         if total_active > 0 {
-            env.storage()
-                .instance()
-                .set(&DataKey::TotalActiveEnrollments, &(total_active - 1));
+            Self::write_total_active_enrollments(&env, total_active - 1);
         }
 
         Self::update_instructor_stats(&env, &course.instructor, |s| {
@@ -4524,12 +4501,35 @@ impl HamplardContract {
             .get(&DataKey::PlatformEnrollmentCap)
     }
 
+    // Existing deployments may still have the legacy instance value. Read it
+    // until the first mutation writes the canonical persistent entry. Leaving
+    // the old value in place avoids an instance write in enrollment paths.
+    fn read_total_active_enrollments(env: &Env) -> u32 {
+        let key = DataKey::TotalActiveEnrollments;
+        if let Some(count) = env.storage().persistent().get(&key) {
+            env.storage().persistent().extend_ttl(
+                &key,
+                Self::PERSISTENT_TTL_THRESHOLD,
+                Self::PERSISTENT_TTL_EXTEND_TO,
+            );
+            return count;
+        }
+        env.storage().instance().get(&key).unwrap_or(0)
+    }
+
+    fn write_total_active_enrollments(env: &Env, count: u32) {
+        let key = DataKey::TotalActiveEnrollments;
+        env.storage().persistent().set(&key, &count);
+        env.storage().persistent().extend_ttl(
+            &key,
+            Self::PERSISTENT_TTL_THRESHOLD,
+            Self::PERSISTENT_TTL_EXTEND_TO,
+        );
+    }
+
     /// Get the current total active enrollments platform-wide.
     pub fn get_total_active_enrollments(env: Env) -> u32 {
-        env.storage()
-            .instance()
-            .get(&DataKey::TotalActiveEnrollments)
-            .unwrap_or(0)
+        Self::read_total_active_enrollments(&env)
     }
 
     /// Update the minimum review delay (in ledger sequences)
@@ -4825,15 +4825,9 @@ impl HamplardContract {
                 .set(&DataKey::Course(course_id.clone()), &course);
 
             // Decrement platform-wide active enrollment counter
-            let total_active: u32 = env
-                .storage()
-                .instance()
-                .get(&DataKey::TotalActiveEnrollments)
-                .unwrap_or(0);
+            let total_active: u32 = Self::read_total_active_enrollments(&env);
             if total_active > 0 {
-                env.storage()
-                    .instance()
-                    .set(&DataKey::TotalActiveEnrollments, &(total_active - 1));
+                Self::write_total_active_enrollments(&env, total_active - 1);
             }
 
             request.status = RefundStatus::Approved;
@@ -5518,14 +5512,24 @@ impl HamplardContract {
     /// Generate a unique enrollment reference and store the mapping
     /// from enrollment_reference -> (student, course_id).
     fn generate_enrollment_ref(env: &Env, student: &Address, course_id: &String) -> String {
+        let key = DataKey::EnrollmentRefCounter;
         let counter: u32 = env
             .storage()
-            .instance()
-            .get(&DataKey::EnrollmentRefCounter)
+            .persistent()
+            .get(&key)
+            .or_else(|| env.storage().instance().get(&key))
             .unwrap_or(1);
-        env.storage()
-            .instance()
-            .set(&DataKey::EnrollmentRefCounter, &(counter + 1));
+        env.storage().persistent().set(
+            &key,
+            &counter
+                .checked_add(1)
+                .expect("enrollment reference counter overflow"),
+        );
+        env.storage().persistent().extend_ttl(
+            &key,
+            Self::PERSISTENT_TTL_THRESHOLD,
+            Self::PERSISTENT_TTL_EXTEND_TO,
+        );
 
         let enrollment_ref = Self::counter_to_string(env, counter);
 
