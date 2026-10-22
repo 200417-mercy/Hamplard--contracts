@@ -19,7 +19,8 @@
 //! - `process_refund` — approves a pending refund; if the enrollment already has a
 //!   certificate issued, the certificate is revoked with reason `REFUNDED` and a
 //!   `certificate_revoked` event is emitted, so no refunded enrollment can leave
-//!   behind a certificate that verifies as valid
+//!   behind a certificate that verifies as valid. Refund requests are rejected for
+//!   free (price 0) enrollments, since there is no economic value to refund.
 //! - `bulk_revoke_course_certificates` — flags every certificate of a course as revoked in one transaction
 //! - `pause_platform` / `unpause_platform` — halts or restores all enrollments
 //! - `add_approved_token` / `remove_approved_token` — controls which token contracts are accepted
